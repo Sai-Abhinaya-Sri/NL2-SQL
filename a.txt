@@ -1,0 +1,1309 @@
+#30-03-2026
+
+import streamlit as st
+import pandas as pd
+import mysql.connector
+from mysql.connector import Error
+import psycopg2
+from psycopg2 import OperationalError as PGError
+from datetime import datetime
+import plotly.express as px
+import requests
+import config
+import re
+from sqlalchemy import create_engine
+
+st.set_page_config(
+    page_title=config.UI_CONFIG['page_title'],
+    page_icon=config.UI_CONFIG['page_icon'],
+    layout=config.UI_CONFIG['layout']
+)
+
+# =============================================================================
+# SESSION STATE INITIALIZATION
+# =============================================================================
+
+if 'query_history' not in st.session_state:
+    st.session_state.query_history = []
+if 'saved_queries' not in st.session_state:
+    st.session_state.saved_queries = {}
+if 'db_connection' not in st.session_state:
+    st.session_state.db_connection = None
+if 'connection_pool' not in st.session_state:
+    st.session_state.connection_pool = None
+if 'tables_info' not in st.session_state:
+    st.session_state.tables_info = {}
+if 'relationships' not in st.session_state:
+    st.session_state.relationships = []
+if 'connection_error' not in st.session_state:
+    st.session_state.connection_error = None
+if 'show_graph' not in st.session_state:
+    st.session_state.show_graph = False
+if 'last_result_df' not in st.session_state:
+    st.session_state.last_result_df = None
+if 'last_suggested_chart' not in st.session_state:
+    st.session_state.last_suggested_chart = None
+if 'last_sql_query' not in st.session_state:
+    st.session_state.last_sql_query = None
+if 'last_final_sql' not in st.session_state:
+    st.session_state.last_final_sql = None
+if 'last_sql_warning' not in st.session_state:
+    st.session_state.last_sql_warning = None
+if 'last_query_error' not in st.session_state:
+    st.session_state.last_query_error = None
+if 'last_token_usage' not in st.session_state:
+    st.session_state.last_token_usage = None
+if 'chip_query' not in st.session_state:
+    st.session_state.chip_query = ""
+if 'last_nl_query' not in st.session_state:
+    st.session_state.last_nl_query = ""
+if 'last_ai_insights' not in st.session_state:
+    st.session_state.last_ai_insights = None
+if 'selected_db' not in st.session_state:
+    st.session_state.selected_db = None  # ✅ DEFAULT TO NONE (no hardcoded MySQL)
+if 'insights_loading' not in st.session_state:
+    st.session_state.insights_loading = False
+
+# ✅ SEPARATE SCHEMA BUCKETS FOR EACH DATABASE (Prevents Cross-Contamination)
+if 'mysql_enabled' not in st.session_state:
+    st.session_state.mysql_enabled = False  # ✅ DEFAULT OFF (not hardcoded True)
+if 'postgres_enabled' not in st.session_state:
+    st.session_state.postgres_enabled = False
+if 'mysql_selected_tables' not in st.session_state:
+    st.session_state.mysql_selected_tables = []
+if 'postgres_selected_tables' not in st.session_state:
+    st.session_state.postgres_selected_tables = []
+if 'mysql_tables_info' not in st.session_state:
+    st.session_state.mysql_tables_info = {}
+if 'postgres_tables_info' not in st.session_state:
+    st.session_state.postgres_tables_info = {}
+
+# =============================================================================
+# DATABASE CONNECTION FUNCTIONS
+# =============================================================================
+
+def create_mysql_connection():
+    try:
+        connection = mysql.connector.connect(
+            host=config.MYSQL_CONFIG['host'],
+            port=config.MYSQL_CONFIG['port'],
+            database=config.MYSQL_CONFIG['database'],
+            user=config.MYSQL_CONFIG['user'],
+            password=config.MYSQL_CONFIG['password'],
+        )
+        if connection.is_connected():
+            return connection, None
+        else:
+            return None, "Failed to connect to MySQL database"
+    except Error as e:
+        return None, f"MySQL Connection Error: {str(e)}"
+    except Exception as e:
+        return None, f"Unexpected Error: {str(e)}"
+
+
+def create_postgres_connection():
+    try:
+        connection = psycopg2.connect(
+            host=config.POSTGRES_CONFIG['host'],
+            port=config.POSTGRES_CONFIG['port'],
+            dbname=config.POSTGRES_CONFIG['database'],
+            user=config.POSTGRES_CONFIG['user'],
+            password=config.POSTGRES_CONFIG['password'],
+        )
+        connection.autocommit = True
+        return connection, None
+    except PGError as e:
+        return None, f"PostgreSQL Connection Error: {str(e)}"
+    except Exception as e:
+        return None, f"Unexpected Error: {str(e)}"
+
+def create_connection_pool():
+    try:
+        pool = mysql.connector.pooling.MySQLConnectionPool(
+            pool_name=config.MYSQL_POOL_CONFIG.get('pool_name', 'nl2sql_pool'),
+            pool_size=config.MYSQL_POOL_CONFIG.get('pool_size', 5),
+            pool_reset_session=config.MYSQL_POOL_CONFIG.get('pool_reset_session', True),
+            host=config.MYSQL_CONFIG['host'],
+            port=config.MYSQL_CONFIG['port'],
+            database=config.MYSQL_CONFIG['database'],
+            user=config.MYSQL_CONFIG['user'],
+            password=config.MYSQL_CONFIG['password'],
+            charset=config.MYSQL_CONFIG.get('charset', 'utf8mb4')
+        )
+        return pool, None
+    except Error as e:
+        return None, f"Connection Pool Error: {str(e)}"
+
+def get_connection_from_pool():
+    if st.session_state.connection_pool:
+        try:
+            return st.session_state.connection_pool.get_connection()
+        except Error as e:
+            st.error(f"Error getting connection from pool: {e}")
+            return None
+    return st.session_state.db_connection
+
+def test_connection(connection):
+    try:
+        if connection and connection.is_connected():
+            cursor = connection.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+            cursor.close()
+            return True
+        return False
+    except:
+        return False
+
+# =============================================================================
+# SCHEMA DETECTION FUNCTIONS
+# =============================================================================
+
+def get_all_tables_schema(connection):
+    """
+    ✅ FIXED: Determine DB type from connection class, not from session state.
+    This allows calling the function for either MySQL or PostgreSQL correctly.
+    """
+    db_type = 'PostgreSQL' if isinstance(connection, psycopg2.extensions.connection) else 'MySQL'
+
+    try:
+        cursor = connection.cursor()
+        excluded_tables = config.DATABASE_CONFIG.get('excluded_tables', [])
+        max_sample_rows = config.DATABASE_CONFIG.get('max_sample_rows', 3)
+
+        if db_type == 'PostgreSQL':
+            cursor.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+            )
+        else:
+            cursor.execute("SHOW TABLES")
+
+        tables = cursor.fetchall()
+
+        all_schemas = {}
+
+        for table_tuple in tables:
+            table_name = table_tuple[0]
+
+            if table_name in excluded_tables:
+                continue
+
+            if db_type == 'PostgreSQL':
+                cursor.execute(
+                    "SELECT column_name, data_type FROM information_schema.columns "
+                    "WHERE table_name = %s ORDER BY ordinal_position",
+                    (table_name,)
+                )
+                columns = cursor.fetchall()
+                cursor.execute(f'SELECT * FROM "{table_name}" LIMIT %s', (max_sample_rows,))
+                sample_data = cursor.fetchall()
+                cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+            else:
+                cursor.execute(f"DESCRIBE `{table_name}`")
+                columns = cursor.fetchall()
+                cursor.execute(f"SELECT * FROM `{table_name}` LIMIT {max_sample_rows}")
+                sample_data = cursor.fetchall()
+                cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+
+            row_count = cursor.fetchone()[0]
+
+            all_schemas[table_name] = {
+                'columns': [{'name': col[0], 'type': col[1]} for col in columns],
+                'sample_data': sample_data,
+                'row_count': row_count
+            }
+
+        cursor.close()
+        return all_schemas, None
+
+    except Exception as e:
+        return {}, f"Error fetching schema: {str(e)}"
+
+
+def nl_to_sql_groq(natural_language_query, tables_info):
+    """
+    ✅ FIXED: Determine DB type by detecting which schema bucket was used.
+    If tables come from postgres_tables_info, use PostgreSQL syntax.
+    If tables come from mysql_tables_info, use MySQL syntax.
+    If mixed, detect from table names or default to MySQL.
+    """
+    api_key = config.GROQ_API_CONFIG['api_key']
+
+    if api_key == 'YOUR_GROQ_API_KEY_HERE':
+        raise Exception("Please set your Groq API key in config.py")
+
+    # ✅ Determine DB type from selected tables
+    # If PostgreSQL tables are selected, use PostgreSQL syntax
+    postgres_selected = set(st.session_state.postgres_selected_tables)
+    tables_are_pg = any(t in postgres_selected for t in tables_info.keys())
+    is_pg = tables_are_pg
+
+    schema_description = f"{'PostgreSQL' if is_pg else 'MySQL'} Database Schema - USE THESE EXACT COLUMN NAMES:\n\n"
+
+    for table_name, info in tables_info.items():
+        if is_pg:
+            schema_description += f'TABLE: "{table_name}" ({info["row_count"]} rows)\n'
+            schema_description += 'COLUMNS (use exactly as shown):\n'
+            for col in info['columns']:
+                schema_description += f'  - "{col["name"]}" ({col["type"]})\n'
+            if info['sample_data'] and len(info['sample_data']) > 0:
+                schema_description += '\nSample row:\n'
+                sample_row = info['sample_data'][0]
+                for idx, col in enumerate(info['columns']):
+                    if idx < len(sample_row):
+                        schema_description += f'  "{col["name"]}" = {sample_row[idx]}\n'
+        else:
+            schema_description += f"TABLE: `{table_name}` ({info['row_count']} rows)\n"
+            schema_description += 'COLUMNS (use exactly as shown):\n'
+            for col in info['columns']:
+                schema_description += f"  - `{col['name']}` ({col['type']})\n"
+            if info['sample_data'] and len(info['sample_data']) > 0:
+                schema_description += '\nSample row:\n'
+                sample_row = info['sample_data'][0]
+                for idx, col in enumerate(info['columns']):
+                    if idx < len(sample_row):
+                        schema_description += f"  `{col['name']}` = {sample_row[idx]}\n"
+
+        schema_description += '\n' + '='*50 + '\n\n'
+
+    if is_pg:
+        prompt = (
+            'You are a PostgreSQL SQL expert. Generate SQL using ONLY the exact column names shown below.\n\n'
+            + schema_description +
+            f'\nUser Question: "{natural_language_query}"\n\n'
+            'CRITICAL RULES:\n'
+            '1. Use ONLY column names listed above\n'
+            '2. NEVER use backticks (`) - PostgreSQL does NOT support them\n'
+            '3. Use unquoted identifiers for normal table/column names\n'
+            '4. Use single quotes for string values\n'
+            '5. Return ONLY executable SQL - no markdown, no ```sql blocks\n'
+            '6. Use proper JOINs when multiple tables needed\n'
+            '7. For top N queries, use ORDER BY ... DESC LIMIT N\n'
+            '8. ALWAYS close all string literals\n'
+            'Generate the SQL query now:'
+        )
+        system_msg = ('You are a PostgreSQL SQL expert. NEVER use backticks. '
+                      'Use unquoted or double-quoted identifiers. '
+                      'Single quotes for string values. Return ONLY executable SQL.')
+    else:
+        prompt = (
+            'You are a MySQL SQL expert. Generate SQL using ONLY the exact column names shown below.\n\n'
+            + schema_description +
+            f'\nUser Question: "{natural_language_query}"\n\n'
+            'CRITICAL RULES:\n'
+            '1. Use ONLY column names listed above\n'
+            '2. ALWAYS use backticks (`) for ALL table and column names\n'
+            '3. Return ONLY executable SQL - no markdown, no ```sql blocks\n'
+            '4. Use proper JOINs when multiple tables needed\n'
+            '5. For top N queries, use ORDER BY ... DESC LIMIT N\n'
+            '6. ALWAYS close all string literals\n'
+            'Generate the SQL query now:'
+        )
+        system_msg = ('You are a MySQL SQL expert. Always use backticks ` for identifiers. Return ONLY executable SQL.')
+
+    url = 'https://api.groq.com/openai/v1/chat/completions'
+    headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'}
+    data = {
+        'messages': [
+            {'role': 'system', 'content': system_msg},
+            {'role': 'user', 'content': prompt}
+        ],
+        'model': config.GROQ_API_CONFIG['model_name'],
+        'temperature': config.GROQ_API_CONFIG['temperature'],
+        'max_tokens': config.GROQ_API_CONFIG['max_tokens']
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=config.GROQ_API_CONFIG['timeout'])
+        response.raise_for_status()
+        result = response.json()
+        sql_query = result['choices'][0]['message']['content'].strip()
+        sql_query = sql_query.replace('```sql', '').replace('```', '').strip()
+        sql_query = sql_query.strip('"').strip("'")
+
+        if is_pg:
+            sql_query = sql_query.replace('`', '')  # strip stray backticks
+
+        usage = result.get('usage', {})
+        token_usage = {
+            'prompt_tokens': usage.get('prompt_tokens', 0),
+            'completion_tokens': usage.get('completion_tokens', 0),
+            'total_tokens': usage.get('total_tokens', 0),
+        }
+
+        return sql_query, token_usage
+
+    except Exception as e:
+        raise Exception(f"Groq API Error: {str(e)}")
+
+
+def fix_sql_syntax(sql_query):
+    """
+    ✅ FIXED: Determine DB type from selected tables instead of session state.
+    """
+    postgres_selected = set(st.session_state.postgres_selected_tables)
+    tables_are_pg = any(t in postgres_selected for t in [sql_query])  # Fallback
+    is_pg = tables_are_pg if tables_are_pg else len(st.session_state.postgres_selected_tables) > 0
+
+    if is_pg:
+        sql_query = sql_query.replace('`', '')  # no backticks in PostgreSQL
+        import re as _re
+        sql_query = _re.sub(r'\[([^\]]+)\]', r'"\1"', sql_query)
+    else:
+        import re as _re
+        sql_query = _re.sub(r'\[([^\]]+)\]', r'`\1`', sql_query)
+
+    stripped = sql_query.rstrip().rstrip(';').rstrip()
+    quote_count = stripped.count("'")
+
+    if quote_count % 2 != 0:
+        had_semicolon = sql_query.rstrip().endswith(';')
+        sql_query = stripped + "'" + (";" if had_semicolon else "")
+
+    return sql_query
+
+def validate_single_db(tables_info):
+    mysql_tables = set(st.session_state.mysql_tables_info.keys())
+    postgres_tables = set(st.session_state.postgres_tables_info.keys())
+
+    uses_mysql = any(t in mysql_tables for t in tables_info)
+    uses_pg = any(t in postgres_tables for t in tables_info)
+
+    if uses_mysql and uses_pg:
+        return False
+    return True
+
+
+# =============================================================================
+# SQL SAFETY VALIDATION
+# =============================================================================
+
+UNSAFE_PATTERNS = re.compile(
+    r'\b(DROP|DELETE|TRUNCATE|ALTER|UPDATE|INSERT|CREATE|RENAME|REPLACE|GRANT|REVOKE)\b',
+    re.IGNORECASE
+)
+
+def validate_sql_safety(sql_query: str):
+    match = UNSAFE_PATTERNS.search(sql_query)
+    if match:
+        return False, match.group(0).upper()
+    return True, None
+
+# =============================================================================
+# RELEVANT TABLE SELECTION
+# =============================================================================
+
+def get_relevant_tables(nl_query: str, tables_info: dict, top_n: int = 5) -> dict:
+    if not tables_info:
+        return tables_info
+    query_tokens = set(re.findall(r'\w+', nl_query.lower()))
+    scores = {}
+    for table_name, info in tables_info.items():
+        score = 0
+        for token in re.findall(r'\w+', table_name.lower()):
+            if token in query_tokens:
+                score += 2
+        for col in info['columns']:
+            for token in re.findall(r'\w+', col['name'].lower()):
+                if token in query_tokens:
+                    score += 1
+        scores[table_name] = score
+    relevant = {t: tables_info[t] for t, s in scores.items() if s > 0}
+    if relevant:
+        top_tables = sorted(relevant, key=lambda t: scores[t], reverse=True)[:top_n]
+        return {t: tables_info[t] for t in top_tables}
+    try:
+        api_key = config.GROQ_API_CONFIG['api_key']
+        table_names = list(tables_info.keys())
+        fallback_prompt = (
+            f"Given these table names: {table_names}\n"
+            f"Which tables are most relevant to answer: \"{nl_query}\"?\n"
+            f"Reply with ONLY a comma-separated list of table names, nothing else."
+        )
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        data = {
+            "messages": [{"role": "user", "content": fallback_prompt}],
+            "model": config.GROQ_API_CONFIG['model_name'],
+            "temperature": 0,
+            "max_tokens": 100
+        }
+        resp = requests.post(url, headers=headers, json=data, timeout=config.GROQ_API_CONFIG['timeout'])
+        resp.raise_for_status()
+        raw = resp.json()['choices'][0]['message']['content'].strip()
+        chosen = [t.strip().strip('`') for t in raw.split(',')]
+        filtered = {t: tables_info[t] for t in chosen if t in tables_info}
+        if filtered:
+            return filtered
+    except Exception:
+        pass
+    return tables_info
+
+def get_user_selected_tables() -> dict:
+    """
+    ✅ CORRECT: Merge selected tables from BOTH databases.
+    """
+    merged_tables = {}
+    
+    # Add selected MySQL tables
+    mysql_tables = st.session_state.mysql_selected_tables
+    for table_name in mysql_tables:
+        if table_name in st.session_state.mysql_tables_info:
+            merged_tables[table_name] = st.session_state.mysql_tables_info[table_name]
+    
+    # Add selected PostgreSQL tables
+    postgres_tables = st.session_state.postgres_selected_tables
+    for table_name in postgres_tables:
+        if table_name in st.session_state.postgres_tables_info:
+            merged_tables[table_name] = st.session_state.postgres_tables_info[table_name]
+    
+    return merged_tables
+
+def get_sqlalchemy_engine(relevant_tables: dict):
+    postgres_tables = set(st.session_state.postgres_tables_info.keys())
+    
+    # If ALL tables belong to postgres → use postgres
+    if all(t in postgres_tables for t in relevant_tables.keys()):
+        cfg = config.POSTGRES_CONFIG
+        return create_engine(
+            f"postgresql+psycopg2://{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg['port']}/{cfg['database']}"
+        )
+    
+    # Else → MySQL
+    cfg = config.MYSQL_CONFIG
+    return create_engine(
+        f"mysql+mysqlconnector://{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg['port']}/{cfg['database']}"
+    )
+
+def execute_sql_query(connection, sql_query):
+    engine = get_sqlalchemy_engine(relevant_tables)
+    try:
+        df = pd.read_sql_query(sql_query, engine)
+        return df, None, sql_query
+    except Exception as e:
+        try:
+            fixed_sql = fix_sql_syntax(sql_query)
+            df = pd.read_sql_query(fixed_sql, engine)
+            return df, "✅ Query auto-fixed (converted [] to ` for MySQL)", fixed_sql
+        except Exception as e2:
+            return None, str(e2), sql_query
+
+# =============================================================================
+# AI INSIGHTS FUNCTION
+# =============================================================================
+
+def generate_ai_insights(nl_query: str, result_df: pd.DataFrame) -> str:
+    """
+    Send the user's question + query results to LLM for business insights.
+    """
+    api_key = config.GROQ_API_CONFIG['api_key']
+    if api_key == 'YOUR_GROQ_API_KEY_HERE':
+        raise Exception("Groq API key not configured")
+    
+    df_summary = f"""
+Dataset Overview:
+- Rows: {len(result_df)}
+- Columns: {len(result_df.columns)}
+- Column names: {', '.join(result_df.columns.tolist())}
+
+Data Preview (first 10 rows):
+{result_df.head(10).to_string()}
+
+Data Statistics:
+{result_df.describe().to_string()}
+"""
+    
+    prompt = f"""You are a business intelligence analyst. Based on the user's question and the query results below, provide clear, actionable business insights.
+
+USER'S ORIGINAL QUESTION:
+"{nl_query}"
+
+QUERY RESULTS:
+{df_summary}
+
+Please provide:
+1. **Key Finding**: The most important insight from the data
+2. **Trends/Patterns**: Any notable patterns, trends, or anomalies
+3. **Business Implication**: What this means for the business
+4. **Recommendations**: 1-2 actionable recommendations
+
+Keep the response concise, professional, and focused on business value. Use bullet points for clarity."""
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    data = {
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a business intelligence analyst. Provide clear, actionable insights from data. Be concise and professional."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "model": config.GROQ_API_CONFIG['model_name'],
+        "temperature": 0.7,
+        "max_tokens": 1000
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=config.GROQ_API_CONFIG['timeout'])
+        response.raise_for_status()
+        result = response.json()
+        insights = result['choices'][0]['message']['content'].strip()
+        return insights
+    except Exception as e:
+        raise Exception(f"Failed to generate insights: {str(e)}")
+
+# =============================================================================
+# VISUALIZATION FUNCTIONS
+# =============================================================================
+
+def create_visualization(df, viz_type):
+    if df is None or df.empty:
+        return None
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    try:
+        if viz_type == "Bar Chart":
+            if categorical_cols and numeric_cols:
+                fig = px.bar(df, x=categorical_cols[0], y=numeric_cols[0],
+                             title=f"{numeric_cols[0]} by {categorical_cols[0]}",
+                             color=numeric_cols[0], color_continuous_scale='Blues')
+                fig.update_layout(showlegend=False, height=500)
+                return fig
+        elif viz_type == "Line Chart":
+            if len(df) > 0:
+                x_col = df.columns[0]
+                y_col = numeric_cols[0] if numeric_cols else df.columns[1]
+                fig = px.line(df, x=x_col, y=y_col, title=f"{y_col} over {x_col}", markers=True)
+                fig.update_traces(line_color='#1f77b4', line_width=3)
+                fig.update_layout(height=500)
+                return fig
+        elif viz_type == "Pie Chart":
+            if categorical_cols and numeric_cols:
+                fig = px.pie(df, names=categorical_cols[0], values=numeric_cols[0],
+                             title=f"Distribution of {numeric_cols[0]} by {categorical_cols[0]}", hole=0.3)
+                fig.update_traces(textposition='inside', textinfo='percent+label')
+                fig.update_layout(height=500)
+                return fig
+        elif viz_type == "Scatter Plot":
+            if len(numeric_cols) >= 2:
+                fig = px.scatter(df, x=numeric_cols[0], y=numeric_cols[1],
+                                 title=f"{numeric_cols[1]} vs {numeric_cols[0]}",
+                                 color=categorical_cols[0] if categorical_cols else None)
+                fig.update_traces(marker=dict(size=10, opacity=0.7))
+                fig.update_layout(height=500)
+                return fig
+        elif viz_type == "Histogram":
+            if numeric_cols:
+                fig = px.histogram(df, x=numeric_cols[0],
+                                   title=f"Distribution of {numeric_cols[0]}",
+                                   nbins=20, color_discrete_sequence=['#1f77b4'])
+                fig.update_layout(height=500, showlegend=False)
+                return fig
+        elif viz_type == "Box Plot":
+            if numeric_cols:
+                if categorical_cols:
+                    fig = px.box(df, x=categorical_cols[0], y=numeric_cols[0],
+                                 title=f"{numeric_cols[0]} by {categorical_cols[0]}",
+                                 color=categorical_cols[0])
+                else:
+                    fig = px.box(df, y=numeric_cols[0],
+                                 title=f"Box Plot of {numeric_cols[0]}",
+                                 color_discrete_sequence=['#1f77b4'])
+                fig.update_layout(height=500)
+                return fig
+        elif viz_type == "Heatmap":
+            if len(numeric_cols) >= 2:
+                corr = df[numeric_cols].corr()
+                fig = px.imshow(corr, labels=dict(color="Correlation"),
+                                x=corr.columns, y=corr.columns,
+                                title="Correlation Heatmap",
+                                color_continuous_scale='RdBu_r', aspect='auto')
+                fig.update_layout(height=500)
+                return fig
+    except Exception as e:
+        print(f"Visualization error: {e}")
+        return None
+    return None
+
+def suggest_best_chart(df):
+    if df is None or df.empty:
+        return "Table"
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    if len(df) <= 1:
+        return "Table"
+    if categorical_cols and numeric_cols and len(df) <= 20:
+        return "Bar Chart"
+    if categorical_cols and numeric_cols:
+        unique_cats = df[categorical_cols[0]].nunique()
+        if unique_cats <= 10 and len(df) <= 50:
+            return "Pie Chart"
+    if len(numeric_cols) >= 2:
+        return "Scatter Plot"
+    if len(df) > 5:
+        return "Line Chart"
+    return "Table"
+
+def is_zero_aggregate(df) -> bool:
+    """Return True when df is a single-row, all-numeric result whose values are all 0."""
+    if df is None or df.empty or len(df) != 1:
+        return False
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    text_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    if not numeric_cols or text_cols:
+        return False
+    return all(df[col].iloc[0] == 0 for col in numeric_cols)
+
+
+def extract_search_terms(nl_query: str) -> list:
+    """Extract potential search terms (names, identifiers) from the query"""
+    quoted = re.findall(r'["\']([^"\']+)["\']', nl_query)
+    if quoted:
+        return quoted
+    stop_words = {
+        'show', 'find', 'get', 'list', 'select', 'display', 'give', 'tell',
+        'what', 'where', 'when', 'how', 'all', 'the', 'me', 'my', 'a', 'an',
+        'of', 'in', 'by', 'for', 'from', 'who', 'which', 'whose', 'top',
+        'total', 'count', 'sum', 'average', 'number', 'many'
+    }
+    words = nl_query.split()
+    capitalized = [
+        w.strip('.,!?') for w in words
+        if w and w[0].isupper() and w.strip('.,!?').lower() not in stop_words
+    ]
+    return capitalized
+
+
+def pre_check_entity_exists(search_terms: list, tables_info: dict, connection) -> tuple:
+    """Quick scan: check if any search term exists in any text column."""
+    if not search_terms or connection is None:
+        return True, None
+
+    try:
+        cursor = connection.cursor()
+        for term in search_terms:
+            term_found = False
+            for table_name, info in tables_info.items():
+                text_cols = [
+                    col['name'] for col in info['columns']
+                    if any(t in col['type'].lower() for t in ('char', 'text', 'enum', 'varchar'))
+                ]
+                for col in text_cols:
+                    try:
+                        cursor.execute(
+                            f"SELECT 1 FROM `{table_name}` WHERE `{col}` LIKE %s LIMIT 1",
+                            (f"%{term}%",)
+                        )
+                        if cursor.fetchone():
+                            term_found = True
+                            break
+                    except Exception:
+                        continue
+                if term_found:
+                    break
+            if not term_found:
+                cursor.close()
+                return False, term
+        cursor.close()
+    except Exception:
+        return True, None
+    return True, None
+
+# =============================================================================
+# ✅ REMOVED: AUTO-CONNECT STARTUP BLOCK
+# This was causing the "default to MySQL" and "non-reactive" bugs.
+# We'll use reactive checkbox logic in the sidebar instead.
+# =============================================================================
+
+# =============================================================================
+# MAIN APP
+# =============================================================================
+
+st.title("📊 NL2SQL Dashboard")
+st.markdown("Query your **MySQL** and/or **PostgreSQL** databases using natural language! Powered by Groq AI ⚡")
+
+api_key = config.GROQ_API_CONFIG['api_key']
+if api_key == 'YOUR_GROQ_API_KEY_HERE':
+    st.error("⚠️ API Key Not Configured! Please set your Groq API key in `config.py`")
+    st.info("Get your API key from: https://console.groq.com")
+    st.stop()
+
+# =============================================================================
+# SIDEBAR
+# =============================================================================
+
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    st.success("✅ API Key Loaded")
+    st.divider()
+
+    # ✅ REACTIVE DATABASE SELECTION
+    st.subheader("🗄️ Database Selection")
+    st.caption("Select one or both databases:")
+    
+    # ────────────────────────────────────────────────────────────────────────
+    # MYSQL CHECKBOX WITH REACTIVE SCHEMA LOADING
+    # ────────────────────────────────────────────────────────────────────────
+    mysql_checked = st.checkbox(
+        "🟠 MySQL",
+        value=st.session_state.mysql_enabled,
+        key="mysql_check"
+    )
+    
+    # ✅ IMMEDIATE ACTION: If checkbox changed False → True, fetch schema
+    if mysql_checked and not st.session_state.mysql_tables_info:
+        with st.spinner("🔄 Loading MySQL schema..."):
+            try:
+                pool, pool_error = create_connection_pool()
+                if pool:
+                    st.session_state.connection_pool = pool
+                    mysql_conn = pool.get_connection()
+                else:
+                    mysql_conn, pool_error = create_mysql_connection()
+                
+                if mysql_conn:
+                    mysql_tables, schema_error = get_all_tables_schema(mysql_conn)
+                    if not schema_error and mysql_tables:
+                        st.session_state.mysql_tables_info = mysql_tables
+                        st.session_state.mysql_enabled = True
+                    if pool is None and mysql_conn:
+                        try:
+                            mysql_conn.close()
+                        except:
+                            pass
+                else:
+                    st.error(f"MySQL Connection Error: {pool_error}")
+                    st.session_state.mysql_enabled = False
+            except Exception as e:
+                st.error(f"Failed to load MySQL schema: {str(e)}")
+                st.session_state.mysql_enabled = False
+    
+    # Always sync the enabled state with the checkbox
+    st.session_state.mysql_enabled = mysql_checked
+    
+    # Show MySQL table multiselect ONLY if checkbox is checked AND schema loaded
+    if st.session_state.mysql_enabled and st.session_state.mysql_tables_info:
+        mysql_tables = [t for t in st.session_state.mysql_tables_info.keys()]
+        st.session_state.mysql_selected_tables = st.multiselect(
+            "📋 MySQL Tables:",
+            options=mysql_tables,
+            default=st.session_state.mysql_selected_tables,
+            key="mysql_tables_select"
+        )
+        if st.session_state.mysql_selected_tables:
+            st.caption(f"✅ {len(st.session_state.mysql_selected_tables)} table(s) selected")
+    
+    st.divider()
+    
+    # ────────────────────────────────────────────────────────────────────────
+    # POSTGRESQL CHECKBOX WITH REACTIVE SCHEMA LOADING
+    # ────────────────────────────────────────────────────────────────────────
+    postgres_checked = st.checkbox(
+        "🐘 PostgreSQL",
+        value=st.session_state.postgres_enabled,
+        key="postgres_check"
+    )
+    
+    # ✅ IMMEDIATE ACTION: If checkbox changed False → True, fetch schema
+    if postgres_checked and not st.session_state.postgres_tables_info:
+        with st.spinner("🔄 Loading PostgreSQL schema..."):
+            try:
+                pg_conn, pg_error = create_postgres_connection()
+                
+                if pg_conn:
+                    pg_tables, schema_error = get_all_tables_schema(pg_conn)
+                    if not schema_error and pg_tables:
+                        st.session_state.postgres_tables_info = pg_tables
+                        st.session_state.postgres_enabled = True
+                    try:
+                        pg_conn.close()
+                    except:
+                        pass
+                else:
+                    st.error(f"PostgreSQL Connection Error: {pg_error}")
+                    st.session_state.postgres_enabled = False
+            except Exception as e:
+                st.error(f"Failed to load PostgreSQL schema: {str(e)}")
+                st.session_state.postgres_enabled = False
+    
+    # Always sync the enabled state with the checkbox
+    st.session_state.postgres_enabled = postgres_checked
+    
+    # Show PostgreSQL table multiselect ONLY if checkbox is checked AND schema loaded
+    if st.session_state.postgres_enabled and st.session_state.postgres_tables_info:
+        postgres_tables = [t for t in st.session_state.postgres_tables_info.keys()]
+        st.session_state.postgres_selected_tables = st.multiselect(
+            "📋 PostgreSQL Tables:",
+            options=postgres_tables,
+            default=st.session_state.postgres_selected_tables,
+            key="postgres_tables_select"
+        )
+        if st.session_state.postgres_selected_tables:
+            st.caption(f"✅ {len(st.session_state.postgres_selected_tables)} table(s) selected")
+    
+    st.divider()
+    
+    # ✅ Update primary DB based on what's selected
+    if st.session_state.postgres_selected_tables:
+        st.session_state.selected_db = 'PostgreSQL'
+    elif st.session_state.mysql_selected_tables:
+        st.session_state.selected_db = 'MySQL'
+    else:
+        st.session_state.selected_db = None
+    
+    # ────────────────────────────────────────────────────────────────────────
+    # CONNECTION STATUS
+    # ────────────────────────────────────────────────────────────────────────
+    st.subheader("📡 Connection Status")
+    mysql_count = len(st.session_state.mysql_tables_info)
+    postgres_count = len(st.session_state.postgres_tables_info)
+    
+    connection_made = mysql_count > 0 or postgres_count > 0
+    
+    if connection_made:
+        if mysql_count > 0:
+            st.success(f"✅ MySQL Connected ({mysql_count} tables)")
+        if postgres_count > 0:
+            st.success(f"✅ PostgreSQL Connected ({postgres_count} tables)")
+        
+        st.divider()
+        total_selected = len(st.session_state.mysql_selected_tables) + len(st.session_state.postgres_selected_tables)
+        if total_selected > 0:
+            num_dbs = sum([1 for x in [st.session_state.mysql_selected_tables, st.session_state.postgres_selected_tables] if x])
+            st.info(f"🎯 **Querying {total_selected} table(s) across {num_dbs} database(s)**")
+    else:
+        st.info("ℹ️ Check MySQL or PostgreSQL above to connect")
+
+    if st.button("🔄 Reconnect to Database"):
+        st.session_state.mysql_tables_info = {}
+        st.session_state.postgres_tables_info = {}
+        st.session_state.mysql_selected_tables = []
+        st.session_state.postgres_selected_tables = []
+        st.rerun()
+
+    # ────────────────────────────────────────────────────────────────────────
+    # AVAILABLE TABLES SECTION (Shows both databases)
+    # ────────────────────────────────────────────────────────────────────────
+    mysql_tables_list = st.session_state.mysql_tables_info
+    postgres_tables_list = st.session_state.postgres_tables_info
+    
+    if mysql_tables_list or postgres_tables_list:
+        st.divider()
+        st.subheader("🗂️ Available Tables")
+        
+        if mysql_tables_list:
+            st.markdown("**🟠 MySQL Tables:**")
+            for table_name, info in mysql_tables_list.items():
+                row_count = info.get('row_count', '?')
+                st.caption(f"📄 {table_name}  •  {row_count} rows")
+        
+        if postgres_tables_list:
+            st.markdown("**🐘 PostgreSQL Tables:**")
+            for table_name, info in postgres_tables_list.items():
+                row_count = info.get('row_count', '?')
+                st.caption(f"📄 {table_name}  •  {row_count} rows")
+
+    # Schema/Debug Details in sidebar expander
+    if mysql_tables_list or postgres_tables_list:
+        st.divider()
+        with st.expander("🗂️ Schema / Debug Details"):
+            st.markdown("**Column names the AI sees:**")
+            
+            if mysql_tables_list:
+                st.markdown("**MySQL:**")
+                for table_name, info in mysql_tables_list.items():
+                    st.write(f"**`{table_name}`** ({info['row_count']} rows)")
+                    cols = [f"`{col['name']}`" for col in info['columns']]
+                    st.code(", ".join(cols), language="sql")
+            
+            if postgres_tables_list:
+                st.markdown("**PostgreSQL:**")
+                for table_name, info in postgres_tables_list.items():
+                    st.write(f"**`{table_name}`** ({info['row_count']} rows)")
+                    cols = [f'"{col["name"]}"' for col in info['columns']]
+                    st.code(", ".join(cols), language="sql")
+
+    if st.session_state.get('last_token_usage'):
+        st.divider()
+        st.subheader("🪙 Last Query Tokens")
+        tu = st.session_state.last_token_usage
+        col1, col2 = st.columns(2)
+        col1.metric("Prompt", tu['prompt_tokens'])
+        col2.metric("Completion", tu['completion_tokens'])
+        st.metric("Total", tu['total_tokens'])
+
+    if st.session_state.query_history:
+        st.divider()
+        with st.expander(f"📜 Query History ({len(st.session_state.query_history)})"):
+            for query in reversed(st.session_state.query_history[-10:]):
+                st.markdown(f"**{query['timestamp']}**")
+                st.caption(f"*{query['nl_query']}*")
+                st.code(query['sql_query'], language="sql")
+                st.caption(f"↳ {query['rows_returned']} rows returned")
+                st.divider()
+
+# =============================================================================
+# MAIN CONTENT
+# =============================================================================
+
+# ✅ Check if any tables are selected from either database
+total_selected = len(st.session_state.mysql_selected_tables) + len(st.session_state.postgres_selected_tables)
+
+if total_selected > 0:
+    tab1, tab2, tab3 = st.tabs(["💬 Query Data", "📊 Explore Tables", "📤 Upload Files"])
+
+    with tab1:
+        st.subheader("💬 Ask Your Question")
+        
+        # ── HELPFUL REMINDER ──
+        mysql_selected = st.session_state.mysql_selected_tables
+        postgres_selected = st.session_state.postgres_selected_tables
+        
+        selection_text = []
+        if mysql_selected:
+            selection_text.append(f"MySQL: {', '.join([f'`{t}`' for t in mysql_selected])}")
+        if postgres_selected:
+            selection_text.append(f"PostgreSQL: {', '.join([f'`{t}`' for t in postgres_selected])}")
+        
+        st.success(f"✅ Ready to query {total_selected} table(s):\n{' | '.join(selection_text)}")
+
+        # Dynamic Example Chips (Use primary DB or default)
+        selected_db = st.session_state.get('selected_db', 'MySQL')
+        
+        if selected_db == 'PostgreSQL':
+            EXAMPLE_CHIPS = [
+                "Show top 5 products using FETCH FIRST",
+                "Analyze data using JSONB fields",
+                "Find recent transactions in the last 7 days",
+                "Group records by region and count entries",
+            ]
+        else:  # MySQL or None
+            EXAMPLE_CHIPS = [
+                "Show top 5 products using LIMIT",
+                "Find records from last 30 days",
+                "Calculate total by category",
+                "List top items by amount",
+            ]
+        
+        chip_cols = st.columns(len(EXAMPLE_CHIPS))
+        for i, chip_text in enumerate(EXAMPLE_CHIPS):
+            with chip_cols[i]:
+                if st.button(chip_text, key=f"chip_{i}", use_container_width=True):
+                    st.session_state.chip_query = chip_text
+                    st.rerun()
+        
+        default_value = st.session_state.chip_query if st.session_state.chip_query else ""
+        
+        nl_query = st.text_area(
+            "Enter your question:",
+            value=default_value,
+            placeholder="e.g. Show top 5 products by price",
+            height=100,
+            key="nl_query_input"
+        )
+
+        execute_button = st.button("🚀 Execute", type="primary", use_container_width=True)
+
+        if execute_button and nl_query:
+            st.session_state.chip_query = ""
+            st.session_state.show_graph = False
+            st.session_state.last_result_df = None
+            st.session_state.last_sql_query = None
+            st.session_state.last_final_sql = None
+            st.session_state.last_sql_warning = None
+            st.session_state.last_query_error = None
+            st.session_state.last_nl_query = nl_query
+            st.session_state.last_ai_insights = None
+            st.session_state.pop('last_no_data_term', None)
+
+            # Pre-check entity existence
+            search_terms = extract_search_terms(nl_query)
+            if search_terms:
+                with st.spinner("🔍 Validating your query against the database..."):
+                    pre_conn = get_connection_from_pool()
+                    filtered_tables = get_user_selected_tables()
+                    found, missing_term = pre_check_entity_exists(
+                        search_terms, filtered_tables, pre_conn
+                    )
+                    if st.session_state.connection_pool and pre_conn:
+                        try:
+                            pre_conn.close()
+                        except:
+                            pass
+                if not found:
+                    st.session_state.last_no_data_term = missing_term
+                    st.rerun()
+
+            with st.spinner("🤖 Generating SQL..."):
+                try:
+                    filtered_tables = get_user_selected_tables()
+                    relevant_tables = get_relevant_tables(nl_query, filtered_tables)
+                    sql_query, token_usage = nl_to_sql_groq(nl_query, relevant_tables)
+                    st.session_state.last_sql_query = sql_query
+                    st.session_state.last_token_usage = token_usage
+
+                    is_safe, blocked_keyword = validate_sql_safety(sql_query)
+                    if not is_safe:
+                        st.session_state.last_query_error = (
+                            f"🚫 Blocked: Generated SQL contains a forbidden operation "
+                            f"**`{blocked_keyword}`**. Only SELECT queries are allowed."
+                        )
+                        st.rerun()
+
+                    conn = get_connection_from_pool()
+                    result_df, error, final_sql = execute_sql_query(conn, sql_query)
+
+                    if st.session_state.connection_pool and conn:
+                        try:
+                            conn.close()
+                        except:
+                            pass
+
+                    if result_df is not None:
+                        st.session_state.last_result_df = result_df
+                        st.session_state.last_final_sql = final_sql
+                        st.session_state.last_sql_warning = error if error else None
+                        st.session_state.last_suggested_chart = suggest_best_chart(result_df)
+                        st.session_state.query_history.append({
+                            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            'nl_query': nl_query,
+                            'sql_query': final_sql,
+                            'rows_returned': len(result_df)
+                        })
+                    else:
+                        st.session_state.last_query_error = error
+
+                except Exception as e:
+                    st.session_state.last_query_error = str(e)
+
+        # Show pre-check "not found" message
+        if st.session_state.get('last_no_data_term'):
+            missing = st.session_state.last_no_data_term
+            st.warning(f"⚠️ I don't know — **'{missing}'** was not found in the database.")
+            st.info(
+                "The database doesn't contain any records matching that name or identifier. "
+                "Please check the spelling or try a different search term."
+            )
+
+        if st.session_state.get('last_query_error'):
+            st.error(f"❌ Error: {st.session_state.last_query_error}")
+            st.info("💡 Try rephrasing your question or check the SQL syntax")
+
+        if st.session_state.last_result_df is not None:
+            result_df = st.session_state.last_result_df
+            warning = st.session_state.get('last_sql_warning')
+
+            if warning:
+                st.warning(warning)
+
+            nl = st.session_state.get('last_nl_query', '')
+            if result_df.empty or len(result_df) == 0:
+                terms = extract_search_terms(nl)
+                if terms:
+                    terms_str = ', '.join([f"**'{t}'**" for t in terms])
+                    st.warning(f"⚠️ No matching records found for {terms_str} in the database.")
+                else:
+                    st.warning("⚠️ No matching records found for your request.")
+                st.info(
+                    "💡 **Suggestions:** Check the spelling · Try different keywords · "
+                    "Browse data in the **Explore Tables** tab"
+                )
+            elif is_zero_aggregate(result_df):
+                st.warning("⚠️ No data found — the count/total for your query is **0**.")
+                st.info(
+                    f"💡 There are no records matching your request in the database. "
+                    "Try a different time period, category, or filter."
+                )
+            else:
+                res_col, dl_col = st.columns([3, 1])
+                with res_col:
+                    st.markdown("### Query Results")
+                with dl_col:
+                    st.write("")
+                    csv = result_df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download",
+                        data=csv,
+                        file_name=f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                result_df = result_df.dropna(how='all').reset_index(drop=True)
+                st.success(f"✅ Returned {len(result_df)} rows")
+                table_height = min(38 + len(result_df) * 35, 500)
+                st.dataframe(result_df, use_container_width=True, height=table_height)
+
+                st.divider()
+
+                if not st.session_state.show_graph:
+                    if st.button("📈 Generate Visual Analysis", use_container_width=True):
+                        st.session_state.show_graph = True
+
+                if st.session_state.show_graph:
+                    st.subheader("📈 Visual Analysis")
+                    chart_options = ["Bar Chart", "Line Chart", "Pie Chart", "Scatter Plot",
+                                     "Histogram", "Box Plot", "Heatmap"]
+                    default_idx = chart_options.index(st.session_state.last_suggested_chart) \
+                        if st.session_state.last_suggested_chart in chart_options else 0
+                    selected_chart = st.selectbox("Chart type:", chart_options,
+                                                  index=default_idx, key="chart_type_selector")
+                    st.caption(f"💡 Auto-suggested: **{st.session_state.last_suggested_chart}**")
+                    fig = create_visualization(result_df, selected_chart)
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.warning("⚠️ Could not render this chart type for the current data shape.")
+                    if st.button("✖ Hide Chart"):
+                        st.session_state.show_graph = False
+
+                st.divider()
+                
+                if st.session_state.last_ai_insights is None and not st.session_state.insights_loading:
+                    if st.button("💡 Generate AI Insights", use_container_width=True):
+                        st.session_state.insights_loading = True
+                        st.rerun()
+                
+                if st.session_state.insights_loading:
+                    with st.spinner("🤖 Analyzing data for business insights..."):
+                        try:
+                            insights = generate_ai_insights(nl, result_df)
+                            st.session_state.last_ai_insights = insights
+                            st.session_state.insights_loading = False
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Failed to generate insights: {str(e)}")
+                            st.session_state.insights_loading = False
+                
+                if st.session_state.last_ai_insights:
+                    st.markdown("### ✨ AI Business Insights")
+                    st.info(st.session_state.last_ai_insights)
+                    
+                    if st.button("🔄 Regenerate Insights"):
+                        st.session_state.last_ai_insights = None
+                        st.rerun()
+
+    with tab2:
+        st.subheader("📊 Table Explorer")
+        st.markdown("Browse your database tables directly.")
+        
+        # Build list of available tables from both databases
+        available_tables = {}
+        for table_name, info in st.session_state.mysql_tables_info.items():
+            available_tables[f"MySQL: {table_name}"] = ('mysql', table_name, info)
+        for table_name, info in st.session_state.postgres_tables_info.items():
+            available_tables[f"PostgreSQL: {table_name}"] = ('postgres', table_name, info)
+        
+        if available_tables:
+            table_display = list(available_tables.keys())
+            selected_display = st.selectbox("Select a table:", table_display)
+            
+            db_type, table_name, table_info = available_tables[selected_display]
+            
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                num_rows = st.number_input("Rows to show:", min_value=5, max_value=1000, value=20)
+            with col2:
+                st.write("")
+                st.write("")
+                load_btn = st.button("🔄 Load Table", type="primary")
+            
+            if load_btn:
+                try:
+                    engine = get_sqlalchemy_engine()
+                    
+                    if db_type == 'postgres':
+                        query = f'SELECT * FROM "{table_name}" LIMIT {num_rows}'
+                    else:  # mysql
+                        query = f"SELECT * FROM `{table_name}` LIMIT {num_rows}"
+                    
+                    table_df = pd.read_sql_query(query, engine)
+                    st.session_state['explorer_df'] = table_df
+                    st.session_state['explorer_table'] = selected_display
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            
+            if 'explorer_df' in st.session_state and st.session_state.get('explorer_table') == selected_display:
+                st.divider()
+                explorer_df = st.session_state['explorer_df']
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Rows Displayed", len(explorer_df))
+                with col2:
+                    st.metric("Total Columns", len(explorer_df.columns))
+                with col3:
+                    st.metric("Total Rows in Table", table_info['row_count'])
+                st.dataframe(explorer_df, use_container_width=True, height=500)
+                csv = explorer_df.to_csv(index=False)
+                st.download_button("📥 Download Table Data", csv,
+                                   f"{table_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "text/csv")
+
+    with tab3:
+        st.subheader("📤 Upload File to Database")
+        selected_db = st.session_state.get('selected_db', 'MySQL')
+        if selected_db is None:
+            selected_db = 'MySQL (default)'
+        st.markdown(f"Upload a CSV or Excel file and push it directly to your **{selected_db}** database as a new table.")
+        uploaded_file = st.file_uploader("Choose a file:", type=["csv", "xlsx"],
+                                         help="Supported formats: CSV, Excel (.xlsx)")
+        if uploaded_file is not None:
+            try:
+                if uploaded_file.name.endswith(".csv"):
+                    preview_df = pd.read_csv(uploaded_file)
+                else:
+                    preview_df = pd.read_excel(uploaded_file)
+                st.success(f"✅ File loaded: **{uploaded_file.name}** — {len(preview_df)} rows, {len(preview_df.columns)} columns")
+                st.markdown("**Preview (first 5 rows):**")
+                st.dataframe(preview_df.head(5), use_container_width=True)
+                st.divider()
+                
+                default_name = uploaded_file.name.rsplit(".", 1)[0].lower().replace(" ", "_")
+                table_name = st.text_input(
+                    f"Table name:",
+                    value=default_name,
+                    placeholder="e.g. sales_data"
+                )
+                
+                push_btn = st.button("🚀 Push to Database", type="primary", use_container_width=True)
+                
+                if push_btn:
+                    if not table_name.strip():
+                        st.error("❌ Please enter a table name!")
+                    else:
+                        with st.spinner(f"Pushing to {selected_db}..."):
+                            try:
+                                uploaded_file.seek(0)
+                                if uploaded_file.name.endswith(".csv"):
+                                    df_to_push = pd.read_csv(uploaded_file)
+                                else:
+                                    df_to_push = pd.read_excel(uploaded_file)
+                                
+                                engine = get_sqlalchemy_engine()
+                                df_to_push.to_sql(name=table_name.strip(), con=engine,
+                                                  if_exists='replace', index=False)
+                                
+                                st.success(f"✅ **{len(df_to_push)} rows** successfully pushed to `{table_name}`!")
+                                st.balloons()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Failed to push: {str(e)}")
+            except Exception as e:
+                st.error(f"❌ Could not read file: {str(e)}")
+else:
+    st.info("ℹ️ **Get Started:**")
+    st.markdown("""
+    1. Check **🟠 MySQL** or **🐘 PostgreSQL** in the sidebar
+    2. Select tables from the dropdown menu
+    3. Ask a natural language question
+    4. View results, visualizations, and AI insights
+    
+    **Need help?** Make sure your database credentials are set in `config.py`
+    """)
+
+st.divider()
+st.caption("NL2SQL Dashboard | Powered by Groq AI | Multi-Database Edition")
